@@ -1,76 +1,96 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import os
 import random
+import sqlite3
 import string
-from fastapi.responses import RedirectResponse # For redirecting to original URL when short URL is accessed
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+
+# Settings come from environment variables, with defaults for local runs
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+DB_PATH = os.getenv("DB_PATH", "urls.db")
 
 app = FastAPI()
 
-# Our database for now. Lives in memory
-db = {}
 
-# Input model, what we expect from the user
+# Open a connection to the SQLite database file
+def get_conn():
+    return sqlite3.connect(DB_PATH)
+
+
+# Create the table on first run if it does not exist yet
+def init_db():
+    with get_conn() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS urls (code TEXT PRIMARY KEY, url TEXT NOT NULL)"
+        )
+
+
+init_db()
+
+
+# What the user sends to /shorten
 class URLInput(BaseModel):
-    url: str 
-# Output model, what we send back
+    url: str
+
+
+# What we send back
 class URLOutput(BaseModel):
     short_code: str
     short_url: str
     original_url: str
 
+
+# Make a random code like "aB3xYz"
 def generate_short_code(length: int = 6) -> str:
-    characters = string.ascii_letters + string.digits #a-z, A-Z, 0-9
+    characters = string.ascii_letters + string.digits
     return "".join(random.choices(characters, k=length))
+
 
 @app.get("/")
 def home():
     return {"message": "Welcome to URL Shortener"}
 
 
+# Health check, must stay above /{short_code} or it will be treated as a code
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.post("/shorten", response_model=URLOutput)
 def shorten_url(data: URLInput):
-    # Keep generating untill we get a code that isn't already taken
-    short_code = generate_short_code()
-    while short_code in db:
-        short_code = generate_short_code()
-
-    db[short_code] = data.url
+    conn = get_conn()
+    try:
+        while True:
+            code = generate_short_code()
+            try:
+                # Save the code and URL
+                with conn:
+                    conn.execute("INSERT INTO urls (code, url) VALUES (?, ?)", (code, data.url))
+                break
+            except sqlite3.IntegrityError:
+                continue  # code already taken, try another one
+    finally:
+        conn.close()  # always close the connection
 
     return URLOutput(
-        short_code=short_code,
-        short_url=f"http://localhost:8000/{short_code}",
-        original_url=data.url
+        short_code=code,
+        short_url=f"{BASE_URL}/{code}",
+        original_url=data.url,
     )
 
+
+# Look up the code and redirect to the original URL
 @app.get("/{short_code}")
 def redirect(short_code: str):
-    if short_code not in db:
-        #to indicate that the requested resource was not found
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT url FROM urls WHERE code = ?", (short_code,)).fetchone()
+    finally:
+        conn.close()
+    # No row means the code does not exist
+    if row is None:
         raise HTTPException(status_code=404, detail=f"Short code '{short_code}' not found")
-    original_url = db[short_code]
-    return RedirectResponse(url=original_url)
-
-@app.get("/debug/db")
-def see_db():
-    return db
-
-
-# @app.post("/items/")
-# def create_item(item: Item):
-#     return {
-#         "received": item,
-#         "message": f"Item '{item.name}' costs ${item.price}"
-#     }
-
-# @app.get("/about")
-# def about():
-#     return {"app": "URL Shortener", "version": 1.0}
-
-# @app.get("/user/{username}")
-# def get_user(username: str):
-#     return {"username": username, "message": f"Hello {username}!"}
-
-# @app.get("/add/{a}/{b}")
-# def add(a: int, b: int):
-#     return {"a": a, "b": b, "result": a + b}
-
+    return RedirectResponse(url=row[0])
